@@ -35,6 +35,7 @@ from typing import Iterable, Optional
 
 import numpy as np
 import pandas as pd
+from matplotlib.patches import Patch
 import matplotlib.pyplot as plt
 
 
@@ -135,16 +136,30 @@ def load_mutation_table(excel_path: Path, sheet: Optional[str] = None) -> pd.Dat
     df = df.copy()
     df["#CHROM"] = df["#CHROM"].astype(str)
     df["MUTANT"] = df["MUTANT"].astype(str)
-    # POS may come as numeric already, but ensure int
     df["POS"] = pd.to_numeric(df["POS"], errors="coerce").astype("Int64")
+
     # Parse %REF with potential comma decimals
     df["PCT_REF"] = df["%REF"].map(_parse_percent_ref)
+
+    # Parse %MUT if present; else derive as 100 - PCT_REF
+    if "%MUT" in df.columns:
+        df["PCT_MUT"] = df["%MUT"].map(_parse_percent_ref)
+    else:
+        df["PCT_MUT"] = np.nan
+
+    # If PCT_MUT is missing but PCT_REF exists, fill with 100 - PCT_REF
+    mask_fill = df["PCT_MUT"].isna() & (~df["PCT_REF"].isna())
+    df.loc[mask_fill, "PCT_MUT"] = 100.0 - df.loc[mask_fill, "PCT_REF"]
+
+    # Clamp to [0, 100]
+    df["PCT_MUT"] = pd.to_numeric(df["PCT_MUT"], errors="coerce").clip(lower=0, upper=100)
 
     # drop rows with missing essential info
     df = df.dropna(subset=["POS"]).copy()
     df["POS"] = df["POS"].astype(int)
 
     return df
+
 
 
 # -------------------------
@@ -270,6 +285,40 @@ def compute_gene_legend_lines(df_mutant: pd.DataFrame) -> list[str]:
     return [f"{gid}: {prod}" for gid, prod in zip(dfg["GENE_ID"], dfg["PRODUCT"])]
 
 
+def _mut_bin_color(v: Optional[float]) -> str:
+    """
+    Map %MUT to a color bin:
+      [0,20):   #2c7bb6
+      [20,40):  #abd9e9
+      [40,60):  #fee090 ##ffffbf
+      [60,80):  #fdae61
+      [80,100]: #d7191c
+    """
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "#808080"  # fallback if missing
+    v = float(v)
+    v = max(0.0, min(100.0, v))  # clamp
+    if 0.0 <= v < 20.0:
+        return "#2c7bb6"
+    if 20.0 <= v < 40.0:
+        return "#abd9e9"
+    if 40.0 <= v < 60.0:
+        return "#fee090" # "#ffffbf"
+    if 60.0 <= v < 80.0:
+        return "#fdae61"
+    # 80–100 inclusive
+    return "#d7191c"
+
+
+def _mut_color_legend_handles() -> tuple[list[Patch], list[str]]:
+    """Return legend handles+labels for %MUT bins in the requested order."""
+    colors = ["#2c7bb6", "#abd9e9", "#ffffbf", "#fdae61", "#d7191c"]
+    labels = ["0–20%", "20–40%", "40–60%", "60–80%", "80–100%"]
+    handles = [Patch(facecolor=c, edgecolor="none") for c in colors]
+    return handles, labels
+
+
+
 
 
 def plot_mutations_for_mutant(df_mutant: pd.DataFrame, mutant: str, outdir: Path, cfg: PlotConfig) -> None:
@@ -338,14 +387,14 @@ def plot_mutations_for_mutant(df_mutant: pd.DataFrame, mutant: str, outdir: Path
         ax.hlines(y=y, xmin=xmin, xmax=chrom_max, linewidth=cfg.line_width, color=cfg.baseline_color)
 
     # Ticks
+    # Ticks colored by %MUT bins
     tick_half = (cfg.tick_height * cfg.row_gap) / 2.0
     for _, row in df_mutant.iterrows():
         y = y_map[row["#CHROM"]]
         x = int(row["POS"])
-        pct = row["PCT_REF"]
-        is_mut_only = (pct is not None) and (not np.isnan(pct)) and (float(pct) == 0.0)
-        color = "red" if is_mut_only else "black"
+        color = _mut_bin_color(row.get("PCT_MUT", np.nan))
         ax.vlines(x=x, ymin=y - tick_half, ymax=y + tick_half, linewidth=cfg.tick_width, color=color)
+
 
     # Right stacked bar
     def _is_mut_only(v: Optional[float]) -> bool:
@@ -411,10 +460,21 @@ def plot_mutations_for_mutant(df_mutant: pd.DataFrame, mutant: str, outdir: Path
     ax_bar.legend(loc="upper right", frameon=False, fontsize=9)
 
     # Legend text (now much lower, in its own row with extra bottom margin)
+    # %MUT color legend + gene legend text (both in bottom row)
+    handles, labels = _mut_color_legend_handles()
+    ax_leg.legend(
+        handles, labels,
+        title="Mutant allele % (%MUT)",
+        loc="upper left", frameon=False, ncol=5,
+        handlelength=1.2, handletextpad=0.5, columnspacing=1.0, borderaxespad=0.0
+    )
+
     if legend_lines:
         legend_text = "Genes shown (GENE_ID: PRODUCT):\n" + "\n".join(legend_lines)
-        ax_leg.text(0.01, 0.98, legend_text, ha="left", va="top",
+        # place gene text clearly below the color legend
+        ax_leg.text(0.01, 0.60, legend_text, ha="left", va="top",
                     fontsize=cfg.label_fontsize, transform=ax_leg.transAxes)
+
 
     outdir.mkdir(parents=True, exist_ok=True)
     png_path = outdir / f"{mutant}_mutations.png"
