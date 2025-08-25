@@ -45,6 +45,49 @@ import matplotlib.pyplot as plt
 
 REQUIRED_COLUMNS = ["#CHROM", "MUTANT", "POS", "%REF"]
 
+@dataclass(frozen=True)
+class PlotConfig:
+    line_width: float = 2.0
+    tick_height: float = 0.6
+    tick_width: float = 0.8
+    dpi: int = 200
+    figsize_per_row: float = 0.45
+    left_margin_in: float = 0.9
+    right_margin_in: float = 0.3
+    top_margin_in: float = 0.6
+    bottom_margin_in: float = 0.8
+
+    baseline_color: str = "#bfbfbf"
+    bar_width_ratio: float = 0.22
+    bar_edgecolor: Optional[str] = None
+
+    # NEW: vertical spacing between chromosomes (1.0 = old spacing). Set 2.0 to “use twice more space”.
+    row_gap: float = 2.0
+
+    # gene label/legend tuning
+    label_rotation: float = 45.0
+    label_fontsize: float = 8.0
+    leader_lines: bool = True
+    leader_color: str = "0.3"
+    leader_width: float = 0.6
+
+    # label stacking (units are “row gaps”)
+    label_base_offset: float = 0.70
+    label_level_step: float = 0.35
+
+    # horizontal anti-collision
+    min_label_gap_frac: float = 0.03
+    min_label_gap_abs: float = 1500.0
+
+    # increase physical row spacing if many stacked levels
+    row_spacing_scale_per_level: float = 0.18
+
+    # legend sizing (inches)
+    legend_inches_per_line: float = 0.18
+    legend_inches_min: float = 0.7
+    legend_inches_max: float = 3.0
+
+
 
 def _parse_percent_ref(val: object) -> Optional[float]:
     """Parse %REF values that may use comma decimal separators.
@@ -64,22 +107,6 @@ def _parse_percent_ref(val: object) -> Optional[float]:
         return float(s)
     except ValueError:
         return None
-
-
-@dataclass(frozen=True)
-class PlotConfig:
-    line_width: float = 2.0
-    tick_height: float = 0.6  # relative to row spacing
-    tick_width: float = 0.8
-    dpi: int = 200
-    figsize_per_row: float = 0.45  # inches per chromosome line
-    left_margin_in: float = 0.9
-    right_margin_in: float = 0.3
-    top_margin_in: float = 0.6
-    bottom_margin_in: float = 0.8
-    baseline_color: str = "#bfbfbf"  # gray genome line
-    bar_width_ratio: float = 0.22  # fraction of total width for the right bar subplot
-    bar_edgecolor: Optional[str] = None  # keep None for flat blocks
 
 
 def load_mutation_table(excel_path: Path, sheet: Optional[str] = None) -> pd.DataFrame:
@@ -125,64 +152,168 @@ def _compute_axes_size(n_rows: int, cfg: PlotConfig) -> tuple[float, float]:
     width = 10.0
     return width, height
 
+def _is_hypothetical(product: Optional[str]) -> bool:
+    """Return True if PRODUCT is (case-insensitive) 'hypothetical protein'."""
+    if product is None or (isinstance(product, float) and pd.isna(product)):
+        return False
+    return str(product).strip().lower() == "hypothetical protein"
+
+
+def compute_gene_label_positions(df_mutant: pd.DataFrame, cfg: PlotConfig) -> dict[str, list[dict]]:
+    """
+    For each chromosome, compute label positions for unique genes:
+      text: 'GENE_ID (n)', x: median POS across that gene's mutations on that chromosome,
+      level: vertical stack level to reduce overlaps along x (greedy placement).
+    """
+    mask = (~df_mutant["PRODUCT"].isna()) & (~df_mutant["GENE_ID"].isna()) & \
+           (~df_mutant["PRODUCT"].apply(_is_hypothetical))
+    dfg = df_mutant.loc[mask, ["#CHROM", "GENE_ID", "PRODUCT", "POS"]].copy()
+    out: dict[str, list[dict]] = {}
+
+    if dfg.empty:
+        return out
+
+    agg = dfg.groupby(["#CHROM", "GENE_ID"]).agg(
+        n=("POS", "count"),
+        x=("POS", "median"),
+    ).reset_index()
+
+    xmax_global = float(df_mutant["POS"].max()) if not df_mutant.empty else 1.0
+    min_gap = max(cfg.min_label_gap_frac * xmax_global, cfg.min_label_gap_abs)
+
+    for chrom, sub in agg.groupby("#CHROM"):
+        sub = sub.sort_values(["x", "n"], ascending=[True, False]).reset_index(drop=True)
+
+        levels_last_x: list[float] = []  # last x placed on each level
+        labels: list[dict] = []
+        for _, row in sub.iterrows():
+            x = float(row["x"])
+            text = f"{row['GENE_ID']} ({int(row['n'])})"
+
+            placed_level = None
+            for lvl, last_x in enumerate(levels_last_x):
+                if abs(x - last_x) >= min_gap:
+                    placed_level = lvl
+                    levels_last_x[lvl] = x
+                    break
+            if placed_level is None:
+                placed_level = len(levels_last_x)
+                levels_last_x.append(x)
+
+            labels.append({"x": x, "text": text, "level": placed_level})
+
+        out[chrom] = labels
+
+    return out
+
+def _compute_dynamic_figsize(
+    n_rows: int,
+    cfg: PlotConfig,
+    max_label_level: int,
+    n_legend_lines: int
+) -> tuple[float, float, float]:
+    """
+    Returns (width_in, total_height_in, legend_height_in).
+    Height increases with row_gap, stacked labels, and legend length.
+    """
+    # physical row spacing scales with row_gap and additional stacking scale
+    row_scale = cfg.row_gap * (1.0 + cfg.row_spacing_scale_per_level * max(0, max_label_level + 1))
+
+    base_main_in = cfg.bottom_margin_in + cfg.top_margin_in + n_rows * cfg.figsize_per_row * row_scale
+
+    # extra headroom above top for stacked labels (offsets are in “row gaps” → inches)
+    label_headroom_in = 0.0
+    if max_label_level >= 0:
+        label_headroom_in = (
+            (cfg.label_base_offset + max_label_level * cfg.label_level_step + 0.6)
+            * cfg.row_gap * cfg.figsize_per_row
+        )
+
+    # legend height in inches
+    legend_in = 0.0
+    if n_legend_lines > 0:
+        legend_in = min(cfg.legend_inches_max,
+                        max(cfg.legend_inches_min, cfg.legend_inches_per_line * (n_legend_lines + 1)))
+
+    total_h = max(2.0, base_main_in + label_headroom_in + legend_in)
+    width = 10.0
+    return width, total_h, legend_in
+
+
+
+def compute_gene_legend_lines(df_mutant: pd.DataFrame) -> list[str]:
+    """
+    Build legend lines 'GENE_ID: PRODUCT' for all non-hypothetical genes present.
+    """
+    mask = (~df_mutant["PRODUCT"].isna()) & (~df_mutant["GENE_ID"].isna()) & \
+           (~df_mutant["PRODUCT"].apply(_is_hypothetical))
+    dfg = df_mutant.loc[mask, ["GENE_ID", "PRODUCT"]].copy()
+    if dfg.empty:
+        return []
+    dfg = dfg.drop_duplicates(subset=["GENE_ID"]).sort_values("GENE_ID")
+    return [f"{gid}: {prod}" for gid, prod in zip(dfg["GENE_ID"], dfg["PRODUCT"])]
+
+
+
 
 def plot_mutations_for_mutant(df_mutant: pd.DataFrame, mutant: str, outdir: Path, cfg: PlotConfig) -> None:
-    """Create and save a mutation map figure for one MUTANT.
-
-    Rows correspond to chromosomes ("#CHROM") present in this mutant's records.
-    For each row, draw a horizontal line from 0 to max POS on that chromosome,
-    and vertical ticks at each mutation position.
-    """
+    """Create and save a mutation map figure for one MUTANT."""
     chrom_order = (
         df_mutant.groupby("#CHROM")["POS"].max().sort_values(ascending=False).index.tolist()
-    )  # longest first by max mutation position observed
+    )
     n = len(chrom_order)
 
-    width_in, height_in = _compute_axes_size(n, cfg)
+    legend_lines = compute_gene_legend_lines(df_mutant)
+
+    # Labels & stacking levels
+    gene_labels_by_chrom = compute_gene_label_positions(df_mutant, cfg)
+    max_level = -1
+    for chrom in gene_labels_by_chrom:
+        for item in gene_labels_by_chrom[chrom]:
+            max_level = max(max_level, int(item["level"]))
+
+    # Dynamic sizing
+    width_in, height_in, legend_in = _compute_dynamic_figsize(
+        n_rows=n, cfg=cfg, max_label_level=max_level, n_legend_lines=len(legend_lines)
+    )
+    legend_ratio = 0.0 if legend_in <= 0 else legend_in / (height_in - legend_in)
+
     fig = plt.figure(figsize=(width_in, height_in), dpi=cfg.dpi)
-    # allocate a slim right column for the stacked bar plot
+
     bar_ratio = max(min(cfg.bar_width_ratio, 0.45), 0.05)
-    gs = fig.add_gridspec(1, 2, width_ratios=[1.0 - bar_ratio, bar_ratio], wspace=0.25)
+    gs = fig.add_gridspec(
+        2, 2,
+        width_ratios=[1.0 - bar_ratio, bar_ratio],
+        height_ratios=[1.0, legend_ratio if legend_ratio > 0 else 0.001],
+        wspace=0.25, hspace=0.12
+    )
     ax = fig.add_subplot(gs[0, 0])
     ax_bar = fig.add_subplot(gs[0, 1])
+    ax_leg = fig.add_subplot(gs[1, :])
 
-    # Y positions: highest at top
-    y_positions = {chrom: i for i, chrom in enumerate(range(n, 0, -1), start=0)}
-    # But we actually want explicit mapping: top row index n..1 mapped to labels
-    # Simpler: create mapping label -> y coordinate (1..n)
-    y_map = {chrom: idx for idx, chrom in enumerate(chrom_order[::-1], start=1)}
+    # Y mapping with expanded row gap
+    y_map = {chrom: idx * cfg.row_gap for idx, chrom in enumerate(chrom_order[::-1], start=1)}
 
-    # Global x-limit: max POS across this mutant (to align rows)
     xmax = int(df_mutant["POS"].max()) if not df_mutant.empty else 1
     xmin = 0
 
-    # Draw chromosome baselines
+    # Baselines
     for chrom in chrom_order:
         y = y_map[chrom]
         chrom_max = int(df_mutant.loc[df_mutant["#CHROM"] == chrom, "POS"].max())
         ax.hlines(y=y, xmin=xmin, xmax=chrom_max, linewidth=cfg.line_width, color=cfg.baseline_color)
 
-    # Draw mutation ticks
+    # Ticks
+    tick_half = (cfg.tick_height * cfg.row_gap) / 2.0
     for _, row in df_mutant.iterrows():
         y = y_map[row["#CHROM"]]
-        x = int(row["POS"])  # position
-        # vertical tick centered on y, height relative to 1.0 row spacing
-        tick_half = cfg.tick_height / 2.0
-        color = "red" if (row["PCT_REF"] is not None and not np.isnan(row["PCT_REF"]) and float(row["PCT_REF"]) == 0.0) else "black"
+        x = int(row["POS"])
+        pct = row["PCT_REF"]
+        is_mut_only = (pct is not None) and (not np.isnan(pct)) and (float(pct) == 0.0)
+        color = "red" if is_mut_only else "black"
         ax.vlines(x=x, ymin=y - tick_half, ymax=y + tick_half, linewidth=cfg.tick_width, color=color)
 
-    # Axes formatting (left plot)
-    ax.set_xlim(xmin, xmax * 1.02)
-    ax.set_ylim(0, n + 1)
-    ax.set_yticks([y_map[c] for c in chrom_order])
-    ax.set_yticklabels(chrom_order)
-    ax.set_xlabel("Position (bp)")
-    ax.set_ylabel("#CHROM")
-    ax.set_title(f"Mutations in {mutant}")
-    ax.grid(axis="x", linestyle=":", alpha=0.4)
-
-    # ---------------- Right subplot: stacked horizontal bar plot ----------------
-    # Count mutations per chromosome: gray = present in reference (PCT_REF != 0), red = mutant-only (PCT_REF == 0)
+    # Right stacked bar
     def _is_mut_only(v: Optional[float]) -> bool:
         return (v is not None) and (not np.isnan(v)) and (float(v) == 0.0)
 
@@ -195,26 +326,72 @@ def plot_mutations_for_mutant(df_mutant: pd.DataFrame, mutant: str, outdir: Path
     counts["count_both"] = counts["count_total"] - counts["count_mut_only"]
 
     y_vals = [y_map[c] for c in chrom_order]
-    ax_bar.barh(y=y_vals, width=counts["count_both"].to_numpy(), left=0, color=cfg.baseline_color, edgecolor=cfg.bar_edgecolor, label="ref+mut")
-    ax_bar.barh(y=y_vals, width=counts["count_mut_only"].to_numpy(), left=counts["count_both"].to_numpy(), color="red", edgecolor=cfg.bar_edgecolor, label="mut-only")
+    ax_bar.barh(y=y_vals, width=counts["count_both"].to_numpy(), left=0,
+                color=cfg.baseline_color, edgecolor=cfg.bar_edgecolor, label="ref+mut")
+    ax_bar.barh(y=y_vals, width=counts["count_mut_only"].to_numpy(),
+                left=counts["count_both"].to_numpy(), color="red",
+                edgecolor=cfg.bar_edgecolor, label="mut-only")
 
-    ax_bar.set_ylim(0, n + 1)
+    # ----- Gene labels above the map (45°) + leader lines -----
+    base_offset = cfg.label_base_offset * cfg.row_gap
+    level_step  = cfg.label_level_step * cfg.row_gap
+
+    # extra headroom above top for labels, in axis units
+    top_extra = 0.0 if max_level < 0 else (cfg.label_base_offset + max_level * cfg.label_level_step + 0.6) * cfg.row_gap
+
+    # Axes formatting (left)
+    y_top = n * cfg.row_gap + top_extra
+    ax.set_xlim(xmin, xmax * 1.02)
+    ax.set_ylim(0, y_top)
+    ax.set_yticks([y_map[c] for c in chrom_order])
+    ax.set_yticklabels(chrom_order)
+    ax.set_xlabel("Position (bp)")
+    ax.set_ylabel("#CHROM")
+    ax.set_title(f"Mutations in {mutant}")
+    ax.grid(axis="x", linestyle=":", alpha=0.4)
+
+    for chrom in chrom_order:
+        if chrom not in gene_labels_by_chrom:
+            continue
+        y_base = y_map[chrom]
+        for item in gene_labels_by_chrom[chrom]:
+            x = float(item["x"])
+            lvl = int(item["level"])
+            y_text = y_base + base_offset + lvl * level_step
+            if cfg.leader_lines:
+                ax.plot([x, x], [y_base + tick_half, y_text - 0.06 * cfg.row_gap],
+                        color=cfg.leader_color, linewidth=cfg.leader_width, alpha=0.8)
+            ax.text(
+                x, y_text, item["text"],
+                ha="center", va="bottom",
+                rotation=cfg.label_rotation, rotation_mode="anchor",
+                fontsize=cfg.label_fontsize
+            )
+
+    # Right axis formatting
+    ax_bar.set_ylim(0, y_top)
     ax_bar.set_yticks(y_vals)
     ax_bar.set_yticklabels([])
     ax_bar.set_xlabel("Mutations")
     xmax_bar = int(max(1, counts["count_total"].max()))
-    ax_bar.set_xlim(0, xmax_bar * 1.15)
+    ax_bar.set_xlim(0, xmax_bar * 1.2)
     ax_bar.grid(axis="x", linestyle=":", alpha=0.3)
     ax_bar.legend(loc="upper right", frameon=False, fontsize=9)
 
-    fig.tight_layout()
+    # Bottom legend
+    ax_leg.axis("off")
+    if legend_lines:
+        legend_text = "Genes shown (GENE_ID: PRODUCT):\n" + "\n".join(legend_lines)
+        ax_leg.text(0.01, 0.98, legend_text, ha="left", va="top",
+                    fontsize=cfg.label_fontsize, transform=ax_leg.transAxes)
 
     outdir.mkdir(parents=True, exist_ok=True)
     png_path = outdir / f"{mutant}_mutations.png"
     svg_path = outdir / f"{mutant}_mutations.svg"
-    fig.savefig(png_path)
-    fig.savefig(svg_path)
+    fig.savefig(png_path, bbox_inches="tight")
+    fig.savefig(svg_path, bbox_inches="tight")
     plt.close(fig)
+
 
 
 # -------------------------
