@@ -61,7 +61,7 @@ class PlotConfig:
     bar_width_ratio: float = 0.22
     bar_edgecolor: Optional[str] = None
 
-    # NEW: vertical spacing between chromosomes (1.0 = old spacing). Set 2.0 to “use twice more space”.
+    # vertical spacing between chromosomes (1.0 = old spacing)
     row_gap: float = 2.0
 
     # gene label/legend tuning
@@ -87,6 +87,12 @@ class PlotConfig:
     legend_inches_min: float = 0.7
     legend_inches_max: float = 3.0
 
+    # NEW: put extra blank space between main plots and legend, and below legend
+    legend_pad_in: float = 0.8            # gap between main plots and legend
+    legend_bottom_margin_in: float = 0.6  # extra blank space below legend
+
+    # NEW: allow a wider figure if needed
+    fig_width_in: float = 12.0
 
 
 def _parse_percent_ref(val: object) -> Optional[float]:
@@ -272,24 +278,42 @@ def plot_mutations_for_mutant(df_mutant: pd.DataFrame, mutant: str, outdir: Path
         for item in gene_labels_by_chrom[chrom]:
             max_level = max(max_level, int(item["level"]))
 
-    # Dynamic sizing
-    width_in, height_in, legend_in = _compute_dynamic_figsize(
-        n_rows=n, cfg=cfg, max_label_level=max_level, n_legend_lines=len(legend_lines)
-    )
-    legend_ratio = 0.0 if legend_in <= 0 else legend_in / (height_in - legend_in)
+    # --- Figure sizing pieces (inches)
+    # main area (axes + label headroom)
+    row_scale = cfg.row_gap * (1.0 + cfg.row_spacing_scale_per_level * max(0, max_level + 1))
+    main_in = cfg.bottom_margin_in + cfg.top_margin_in + n * cfg.figsize_per_row * row_scale
+    label_headroom_in = 0.0
+    if max_level >= 0:
+        label_headroom_in = (
+            (cfg.label_base_offset + max_level * cfg.label_level_step + 0.6)
+            * cfg.row_gap * cfg.figsize_per_row
+        )
+    main_in += label_headroom_in
 
-    fig = plt.figure(figsize=(width_in, height_in), dpi=cfg.dpi)
+    # legend + padding (move legend further down)
+    pad_in = max(0.4, cfg.legend_pad_in)
+    legend_text_in = 0.0
+    if legend_lines:
+        legend_text_in = min(cfg.legend_inches_max,
+                             max(cfg.legend_inches_min, cfg.legend_inches_per_line * (len(legend_lines) + 1)))
+    legend_in = legend_text_in + cfg.legend_bottom_margin_in
 
+    total_h = max(2.0, main_in + pad_in + legend_in)
+
+    fig = plt.figure(figsize=(cfg.fig_width_in, total_h), dpi=cfg.dpi)
+
+    # Grid: 3 rows -> [main | spacer | legend]
     bar_ratio = max(min(cfg.bar_width_ratio, 0.45), 0.05)
     gs = fig.add_gridspec(
-        2, 2,
+        3, 2,
         width_ratios=[1.0 - bar_ratio, bar_ratio],
-        height_ratios=[1.0, legend_ratio if legend_ratio > 0 else 0.001],
-        wspace=0.25, hspace=0.12
+        height_ratios=[main_in, pad_in, legend_in],
+        wspace=0.25, hspace=0.00
     )
-    ax = fig.add_subplot(gs[0, 0])
+    ax     = fig.add_subplot(gs[0, 0])
     ax_bar = fig.add_subplot(gs[0, 1])
-    ax_leg = fig.add_subplot(gs[1, :])
+    ax_pad = fig.add_subplot(gs[1, :]); ax_pad.axis("off")  # spacer
+    ax_leg = fig.add_subplot(gs[2, :]); ax_leg.axis("off")
 
     # Y mapping with expanded row gap
     y_map = {chrom: idx * cfg.row_gap for idx, chrom in enumerate(chrom_order[::-1], start=1)}
@@ -335,9 +359,7 @@ def plot_mutations_for_mutant(df_mutant: pd.DataFrame, mutant: str, outdir: Path
     # ----- Gene labels above the map (45°) + leader lines -----
     base_offset = cfg.label_base_offset * cfg.row_gap
     level_step  = cfg.label_level_step * cfg.row_gap
-
-    # extra headroom above top for labels, in axis units
-    top_extra = 0.0 if max_level < 0 else (cfg.label_base_offset + max_level * cfg.label_level_step + 0.6) * cfg.row_gap
+    top_extra   = 0.0 if max_level < 0 else (cfg.label_base_offset + max_level * cfg.label_level_step + 0.6) * cfg.row_gap
 
     # Axes formatting (left)
     y_top = n * cfg.row_gap + top_extra
@@ -378,8 +400,7 @@ def plot_mutations_for_mutant(df_mutant: pd.DataFrame, mutant: str, outdir: Path
     ax_bar.grid(axis="x", linestyle=":", alpha=0.3)
     ax_bar.legend(loc="upper right", frameon=False, fontsize=9)
 
-    # Bottom legend
-    ax_leg.axis("off")
+    # Legend text (now much lower, in its own row with extra bottom margin)
     if legend_lines:
         legend_text = "Genes shown (GENE_ID: PRODUCT):\n" + "\n".join(legend_lines)
         ax_leg.text(0.01, 0.98, legend_text, ha="left", va="top",
@@ -391,7 +412,6 @@ def plot_mutations_for_mutant(df_mutant: pd.DataFrame, mutant: str, outdir: Path
     fig.savefig(png_path, bbox_inches="tight")
     fig.savefig(svg_path, bbox_inches="tight")
     plt.close(fig)
-
 
 
 # -------------------------
