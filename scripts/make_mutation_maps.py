@@ -167,8 +167,11 @@ def _is_hypothetical(product: Optional[str]) -> bool:
 def compute_gene_label_positions(df_mutant: pd.DataFrame, cfg: PlotConfig) -> dict[str, list[dict]]:
     """
     For each chromosome, compute label positions for unique genes:
-      text: 'GENE_ID (n)', x: median POS across that gene's mutations on that chromosome,
+      text: 'GENE_ID (n), PRODUCT'
+      x: median POS across that gene's mutations on that chromosome,
       level: vertical stack level to reduce overlaps along x (greedy placement).
+
+    Only rows where PRODUCT is not 'hypothetical protein' are considered.
     """
     mask = (~df_mutant["PRODUCT"].isna()) & (~df_mutant["GENE_ID"].isna()) & \
            (~df_mutant["PRODUCT"].apply(_is_hypothetical))
@@ -178,23 +181,30 @@ def compute_gene_label_positions(df_mutant: pd.DataFrame, cfg: PlotConfig) -> di
     if dfg.empty:
         return out
 
+    # For PRODUCT per (chrom, gene), prefer the most frequent (mode), else first
     agg = dfg.groupby(["#CHROM", "GENE_ID"]).agg(
         n=("POS", "count"),
         x=("POS", "median"),
+        product=("PRODUCT", lambda s: s.mode().iloc[0] if not s.mode().empty else s.iloc[0]),
     ).reset_index()
 
     xmax_global = float(df_mutant["POS"].max()) if not df_mutant.empty else 1.0
     min_gap = max(cfg.min_label_gap_frac * xmax_global, cfg.min_label_gap_abs)
 
     for chrom, sub in agg.groupby("#CHROM"):
+        # left-to-right by position; for ties, show higher-count labels lower (earlier)
         sub = sub.sort_values(["x", "n"], ascending=[True, False]).reset_index(drop=True)
 
         levels_last_x: list[float] = []  # last x placed on each level
         labels: list[dict] = []
         for _, row in sub.iterrows():
             x = float(row["x"])
-            text = f"{row['GENE_ID']} ({int(row['n'])})"
+            # Build the label text with product included
+            prod = str(row["product"]).strip()
+            # text = f"{row['GENE_ID']} ({int(row['n'])}), {prod}"
+            text = f"{prod} ({int(row['n'])})"
 
+            # place on the lowest level that is far enough from last placed x
             placed_level = None
             for lvl, last_x in enumerate(levels_last_x):
                 if abs(x - last_x) >= min_gap:
@@ -210,6 +220,7 @@ def compute_gene_label_positions(df_mutant: pd.DataFrame, cfg: PlotConfig) -> di
         out[chrom] = labels
 
     return out
+
 
 def _compute_dynamic_figsize(
     n_rows: int,
