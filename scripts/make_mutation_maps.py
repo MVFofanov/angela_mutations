@@ -312,13 +312,10 @@ def _mut_bin_color(v: Optional[float]) -> str:
 
 def _mut_color_legend_handles() -> tuple[list[Patch], list[str]]:
     """Return legend handles+labels for %MUT bins in the requested order."""
-    colors = ["#2c7bb6", "#abd9e9", "#ffffbf", "#fdae61", "#d7191c"]
+    colors = ["#2c7bb6", "#abd9e9", "#fee090", "#fdae61", "#d7191c"]
     labels = ["0–20%", "20–40%", "40–60%", "60–80%", "80–100%"]
     handles = [Patch(facecolor=c, edgecolor="none") for c in colors]
     return handles, labels
-
-
-
 
 
 def plot_mutations_for_mutant(df_mutant: pd.DataFrame, mutant: str, outdir: Path, cfg: PlotConfig) -> None:
@@ -386,7 +383,6 @@ def plot_mutations_for_mutant(df_mutant: pd.DataFrame, mutant: str, outdir: Path
         chrom_max = int(df_mutant.loc[df_mutant["#CHROM"] == chrom, "POS"].max())
         ax.hlines(y=y, xmin=xmin, xmax=chrom_max, linewidth=cfg.line_width, color=cfg.baseline_color)
 
-    # Ticks
     # Ticks colored by %MUT bins
     tick_half = (cfg.tick_height * cfg.row_gap) / 2.0
     for _, row in df_mutant.iterrows():
@@ -395,25 +391,35 @@ def plot_mutations_for_mutant(df_mutant: pd.DataFrame, mutant: str, outdir: Path
         color = _mut_bin_color(row.get("PCT_MUT", np.nan))
         ax.vlines(x=x, ymin=y - tick_half, ymax=y + tick_half, linewidth=cfg.tick_width, color=color)
 
+    # ----- Right stacked bar — %MUT bins (same colors/order as legend) -----
+    bin_edges  = [-1, 20, 40, 60, 80, 101]  # [-1,20), [20,40), [40,60), [60,80), [80,101)
+    bin_ids    = [0, 1, 2, 3, 4]
+    bin_colors = ["#2c7bb6", "#abd9e9", "#fee090", "#fdae61", "#d7191c"]
 
-    # Right stacked bar
-    def _is_mut_only(v: Optional[float]) -> bool:
-        return (v is not None) and (not np.isnan(v)) and (float(v) == 0.0)
-
-    counts = (
-        df_mutant.assign(is_mut_only=df_mutant["PCT_REF"].apply(_is_mut_only))
-        .groupby("#CHROM")
-        .agg(count_mut_only=("is_mut_only", "sum"), count_total=("POS", "count"))
-        .reindex(chrom_order)
+    # drop NaN %MUT from bar counts (ticks on left still show gray if %MUT missing)
+    df_bins = df_mutant.dropna(subset=["PCT_MUT"]).copy()
+    df_bins["mut_bin"] = pd.cut(
+        df_bins["PCT_MUT"], bins=bin_edges, labels=bin_ids, right=False
     )
-    counts["count_both"] = counts["count_total"] - counts["count_mut_only"]
+
+    # counts per chromosome per bin
+    counts = (
+        df_bins.groupby(["#CHROM", "mut_bin"])
+        .size()
+        .unstack(fill_value=0)
+        .reindex(index=chrom_order, columns=bin_ids, fill_value=0)
+    )
 
     y_vals = [y_map[c] for c in chrom_order]
-    ax_bar.barh(y=y_vals, width=counts["count_both"].to_numpy(), left=0,
-                color=cfg.baseline_color, edgecolor=cfg.bar_edgecolor, label="ref+mut")
-    ax_bar.barh(y=y_vals, width=counts["count_mut_only"].to_numpy(),
-                left=counts["count_both"].to_numpy(), color="red",
-                edgecolor=cfg.bar_edgecolor, label="mut-only")
+    left = np.zeros(len(chrom_order), dtype=float)
+
+    for i, color in enumerate(bin_colors):
+        widths = counts[i].to_numpy() if i in counts.columns else np.zeros(len(chrom_order))
+        ax_bar.barh(
+            y=y_vals, width=widths, left=left,
+            color=color, edgecolor=cfg.bar_edgecolor
+        )
+        left += widths
 
     # ----- Gene labels above the map (45°) + leader lines -----
     base_offset = cfg.label_base_offset * cfg.row_gap
@@ -449,21 +455,20 @@ def plot_mutations_for_mutant(df_mutant: pd.DataFrame, mutant: str, outdir: Path
                 fontsize=cfg.label_fontsize
             )
 
-    # Right axis formatting
+    # Right axis formatting (no legend here; color legend is in the bottom row)
     ax_bar.set_ylim(0, y_top)
     ax_bar.set_yticks(y_vals)
     ax_bar.set_yticklabels([])
     ax_bar.set_xlabel("Mutations")
-    xmax_bar = int(max(1, counts["count_total"].max()))
+    xmax_bar = int(max(1, counts.sum(axis=1).max()))
     ax_bar.set_xlim(0, xmax_bar * 1.2)
     ax_bar.grid(axis="x", linestyle=":", alpha=0.3)
-    ax_bar.legend(loc="upper right", frameon=False, fontsize=9)
 
-    # Legend text (now much lower, in its own row with extra bottom margin)
-    # %MUT color legend + gene legend text (both in bottom row)
-    handles, labels = _mut_color_legend_handles()
+    # Bottom row: %MUT color legend + gene legend text
+    color_handles = [Patch(facecolor=c, edgecolor="none") for c in bin_colors]
+    color_labels  = ["0–20%", "20–40%", "40–60%", "60–80%", "80–100%"]
     ax_leg.legend(
-        handles, labels,
+        color_handles, color_labels,
         title="Mutant allele % (%MUT)",
         loc="upper left", frameon=False, ncol=5,
         handlelength=1.2, handletextpad=0.5, columnspacing=1.0, borderaxespad=0.0
@@ -474,7 +479,6 @@ def plot_mutations_for_mutant(df_mutant: pd.DataFrame, mutant: str, outdir: Path
         # place gene text clearly below the color legend
         ax_leg.text(0.01, 0.60, legend_text, ha="left", va="top",
                     fontsize=cfg.label_fontsize, transform=ax_leg.transAxes)
-
 
     outdir.mkdir(parents=True, exist_ok=True)
     png_path = outdir / f"{mutant}_mutations.png"
