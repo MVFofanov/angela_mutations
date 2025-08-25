@@ -287,35 +287,42 @@ def compute_gene_legend_lines(df_mutant: pd.DataFrame) -> list[str]:
 
 def _mut_bin_color(v: Optional[float]) -> str:
     """
-    Map %MUT to a color bin:
-      [0,20):   #2c7bb6
-      [20,40):  #abd9e9
-      [40,60):  #fee090 ##ffffbf
-      [60,80):  #fdae61
-      [80,100]: #d7191c
+    Map %MUT to new color bins:
+      100%         -> #d73027
+      [80,100)     -> #fc8d59
+      [60,80)      -> #fee090
+      [40,60)      -> #e0f3f8
+      [20,40)      -> #91bfdb
+      [0,20)       -> #4575b4
     """
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return "#808080"  # fallback if missing
     v = float(v)
     v = max(0.0, min(100.0, v))  # clamp
-    if 0.0 <= v < 20.0:
-        return "#2c7bb6"
-    if 20.0 <= v < 40.0:
-        return "#abd9e9"
-    if 40.0 <= v < 60.0:
-        return "#fee090" # "#ffffbf"
+    if v == 100.0:
+        return "#d73027"
+    if 80.0 <= v < 100.0:
+        return "#fc8d59"
     if 60.0 <= v < 80.0:
-        return "#fdae61"
-    # 80–100 inclusive
-    return "#d7191c"
+        return "#fee090"
+    if 40.0 <= v < 60.0:
+        return "#e0f3f8"
+    if 20.0 <= v < 40.0:
+        return "#91bfdb"
+    # 0–20
+    return "#4575b4"
 
 
 def _mut_color_legend_handles() -> tuple[list[Patch], list[str]]:
-    """Return legend handles+labels for %MUT bins in the requested order."""
-    colors = ["#2c7bb6", "#abd9e9", "#fee090", "#fdae61", "#d7191c"]
-    labels = ["0–20%", "20–40%", "40–60%", "60–80%", "80–100%"]
+    """
+    Legend handles/labels for %MUT bins in ascending order:
+      0–<20%, 20–<40%, 40–<60%, 60–<80%, 80–<100%, 100%
+    """
+    colors = ["#4575b4", "#91bfdb", "#e0f3f8", "#fee090", "#fc8d59", "#d73027"]
+    labels = ["0–<20%", "20–<40%", "40–<60%", "60–<80%", "80–<100%", "100%"]
     handles = [Patch(facecolor=c, edgecolor="none") for c in colors]
     return handles, labels
+
 
 
 def plot_mutations_for_mutant(df_mutant: pd.DataFrame, mutant: str, outdir: Path, cfg: PlotConfig) -> None:
@@ -335,7 +342,6 @@ def plot_mutations_for_mutant(df_mutant: pd.DataFrame, mutant: str, outdir: Path
             max_level = max(max_level, int(item["level"]))
 
     # --- Figure sizing pieces (inches)
-    # main area (axes + label headroom)
     row_scale = cfg.row_gap * (1.0 + cfg.row_spacing_scale_per_level * max(0, max_level + 1))
     main_in = cfg.bottom_margin_in + cfg.top_margin_in + n * cfg.figsize_per_row * row_scale
     label_headroom_in = 0.0
@@ -346,7 +352,6 @@ def plot_mutations_for_mutant(df_mutant: pd.DataFrame, mutant: str, outdir: Path
         )
     main_in += label_headroom_in
 
-    # legend + padding (move legend further down)
     pad_in = max(0.4, cfg.legend_pad_in)
     legend_text_in = 0.0
     if legend_lines:
@@ -368,7 +373,7 @@ def plot_mutations_for_mutant(df_mutant: pd.DataFrame, mutant: str, outdir: Path
     )
     ax     = fig.add_subplot(gs[0, 0])
     ax_bar = fig.add_subplot(gs[0, 1])
-    ax_pad = fig.add_subplot(gs[1, :]); ax_pad.axis("off")  # spacer
+    ax_pad = fig.add_subplot(gs[1, :]); ax_pad.axis("off")
     ax_leg = fig.add_subplot(gs[2, :]); ax_leg.axis("off")
 
     # Y mapping with expanded row gap
@@ -391,29 +396,29 @@ def plot_mutations_for_mutant(df_mutant: pd.DataFrame, mutant: str, outdir: Path
         color = _mut_bin_color(row.get("PCT_MUT", np.nan))
         ax.vlines(x=x, ymin=y - tick_half, ymax=y + tick_half, linewidth=cfg.tick_width, color=color)
 
-    # ----- Right stacked bar — %MUT bins (same colors/order as legend) -----
-    bin_edges  = [-1, 20, 40, 60, 80, 101]  # [-1,20), [20,40), [40,60), [60,80), [80,101)
-    bin_ids    = [0, 1, 2, 3, 4]
-    bin_colors = ["#2c7bb6", "#abd9e9", "#fee090", "#fdae61", "#d7191c"]
+    # ----- Right stacked bar — %MUT bins (ASCENDING order to match legend) -----
+    # Bins: [0,20), [20,40), [40,60), [60,80), [80,100), {100}
+    bin_edges        = [-1, 20, 40, 60, 80, 100, 101]    # right=False -> [a,b)
+    bin_labels_asc   = [0, 1, 2, 3, 4, 5]                # ascending by edges
+    order_for_plot   = [0, 1, 2, 3, 4, 5]                # low -> high
+    colors_for_order = ["#4575b4", "#91bfdb", "#e0f3f8", "#fee090", "#fc8d59", "#d73027"]
 
-    # drop NaN %MUT from bar counts (ticks on left still show gray if %MUT missing)
+    # use rows with non-NaN %MUT for bar counts
     df_bins = df_mutant.dropna(subset=["PCT_MUT"]).copy()
-    df_bins["mut_bin"] = pd.cut(
-        df_bins["PCT_MUT"], bins=bin_edges, labels=bin_ids, right=False
-    )
+    df_bins["mut_bin"] = pd.cut(df_bins["PCT_MUT"], bins=bin_edges, labels=bin_labels_asc, right=False)
 
     # counts per chromosome per bin
     counts = (
         df_bins.groupby(["#CHROM", "mut_bin"])
         .size()
         .unstack(fill_value=0)
-        .reindex(index=chrom_order, columns=bin_ids, fill_value=0)
+        .reindex(index=chrom_order, columns=bin_labels_asc, fill_value=0)
     )
 
     y_vals = [y_map[c] for c in chrom_order]
     left = np.zeros(len(chrom_order), dtype=float)
 
-    for i, color in enumerate(bin_colors):
+    for i, color in zip(order_for_plot, colors_for_order):
         widths = counts[i].to_numpy() if i in counts.columns else np.zeros(len(chrom_order))
         ax_bar.barh(
             y=y_vals, width=widths, left=left,
@@ -465,18 +470,16 @@ def plot_mutations_for_mutant(df_mutant: pd.DataFrame, mutant: str, outdir: Path
     ax_bar.grid(axis="x", linestyle=":", alpha=0.3)
 
     # Bottom row: %MUT color legend + gene legend text
-    color_handles = [Patch(facecolor=c, edgecolor="none") for c in bin_colors]
-    color_labels  = ["0–20%", "20–40%", "40–60%", "60–80%", "80–100%"]
+    handles, labels = _mut_color_legend_handles()
     ax_leg.legend(
-        color_handles, color_labels,
+        handles, labels,
         title="Mutant allele % (%MUT)",
-        loc="upper left", frameon=False, ncol=5,
+        loc="upper left", frameon=False, ncol=6,
         handlelength=1.2, handletextpad=0.5, columnspacing=1.0, borderaxespad=0.0
     )
 
     if legend_lines:
         legend_text = "Genes shown (GENE_ID: PRODUCT):\n" + "\n".join(legend_lines)
-        # place gene text clearly below the color legend
         ax_leg.text(0.01, 0.60, legend_text, ha="left", va="top",
                     fontsize=cfg.label_fontsize, transform=ax_leg.transAxes)
 
