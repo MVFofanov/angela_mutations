@@ -270,15 +270,28 @@ def _compute_dynamic_figsize(
 
 def compute_gene_legend_lines(df_mutant: pd.DataFrame) -> list[str]:
     """
-    Build legend lines 'GENE_ID: PRODUCT' for all genes present
+    Build legend lines 'GENE_ID: PRODUCT (n)' for all genes present
     (including 'hypothetical protein'), requiring non-null PRODUCT and GENE_ID.
+    The count n is the number of mutation rows for that gene in this mutant
+    (summed across chromosomes).
     """
     mask = (~df_mutant["PRODUCT"].isna()) & (~df_mutant["GENE_ID"].isna())
     dfg = df_mutant.loc[mask, ["GENE_ID", "PRODUCT"]].copy()
     if dfg.empty:
         return []
-    dfg = dfg.drop_duplicates(subset=["GENE_ID"]).sort_values("GENE_ID")
-    return [f"{gid}: {prod}" for gid, prod in zip(dfg["GENE_ID"], dfg["PRODUCT"])]
+
+    # Choose a stable PRODUCT per GENE_ID (mode if available, else first) and count mutations
+    agg = (
+        dfg.groupby("GENE_ID")
+           .agg(
+               product=("PRODUCT", lambda s: s.mode().iloc[0] if not s.mode().empty else s.iloc[0]),
+               n=("PRODUCT", "size"),
+           )
+           .reset_index()
+           .sort_values("GENE_ID")
+    )
+
+    return [f"{gid}: {prod} ({int(n)})" for gid, prod, n in agg[["GENE_ID", "product", "n"]].to_numpy()]
 
 
 def _mut_bin_color(v: Optional[float]) -> str:
