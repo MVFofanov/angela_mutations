@@ -182,14 +182,13 @@ def _is_hypothetical(product: Optional[str]) -> bool:
 def compute_gene_label_positions(df_mutant: pd.DataFrame, cfg: PlotConfig) -> dict[str, list[dict]]:
     """
     For each chromosome, compute label positions for unique genes:
-      text: 'GENE_ID (n), PRODUCT'
+      text: 'PRODUCT (n)'  where n is the number of mutations in that gene on that chromosome,
       x: median POS across that gene's mutations on that chromosome,
       level: vertical stack level to reduce overlaps along x (greedy placement).
 
-    Only rows where PRODUCT is not 'hypothetical protein' are considered.
+    Includes all genes (including 'hypothetical protein'). Requires non-null PRODUCT and GENE_ID.
     """
-    mask = (~df_mutant["PRODUCT"].isna()) & (~df_mutant["GENE_ID"].isna()) & \
-           (~df_mutant["PRODUCT"].apply(_is_hypothetical))
+    mask = (~df_mutant["PRODUCT"].isna()) & (~df_mutant["GENE_ID"].isna())
     dfg = df_mutant.loc[mask, ["#CHROM", "GENE_ID", "PRODUCT", "POS"]].copy()
     out: dict[str, list[dict]] = {}
 
@@ -214,12 +213,10 @@ def compute_gene_label_positions(df_mutant: pd.DataFrame, cfg: PlotConfig) -> di
         labels: list[dict] = []
         for _, row in sub.iterrows():
             x = float(row["x"])
-            # Build the label text with product included
             prod = str(row["product"]).strip()
-            # text = f"{row['GENE_ID']} ({int(row['n'])}), {prod}"
             text = f"{prod} ({int(row['n'])})"
 
-            # place on the lowest level that is far enough from last placed x
+            # place on the lowest level far enough from the last placed x
             placed_level = None
             for lvl, last_x in enumerate(levels_last_x):
                 if abs(x - last_x) >= min_gap:
@@ -271,13 +268,12 @@ def _compute_dynamic_figsize(
     return width, total_h, legend_in
 
 
-
 def compute_gene_legend_lines(df_mutant: pd.DataFrame) -> list[str]:
     """
-    Build legend lines 'GENE_ID: PRODUCT' for all non-hypothetical genes present.
+    Build legend lines 'GENE_ID: PRODUCT' for all genes present
+    (including 'hypothetical protein'), requiring non-null PRODUCT and GENE_ID.
     """
-    mask = (~df_mutant["PRODUCT"].isna()) & (~df_mutant["GENE_ID"].isna()) & \
-           (~df_mutant["PRODUCT"].apply(_is_hypothetical))
+    mask = (~df_mutant["PRODUCT"].isna()) & (~df_mutant["GENE_ID"].isna())
     dfg = df_mutant.loc[mask, ["GENE_ID", "PRODUCT"]].copy()
     if dfg.empty:
         return []
@@ -316,10 +312,10 @@ def _mut_bin_color(v: Optional[float]) -> str:
 def _mut_color_legend_handles() -> tuple[list[Patch], list[str]]:
     """
     Legend handles/labels for %MUT bins in ascending order:
-      0–<20%, 20–<40%, 40–<60%, 60–<80%, 80–<100%, 100%
+      [0, 20), [20, 40), [40, 60), [60, 80), [80, 100), 100
     """
     colors = ["#4575b4", "#91bfdb", "#e0f3f8", "#fee090", "#fc8d59", "#d73027"]
-    labels = ["0–<20%", "20–<40%", "40–<60%", "60–<80%", "80–<100%", "100%"]
+    labels = ["[0, 20)", "[20, 40)", "[40, 60)", "[60, 80)", "[80, 100)", "100"]
     handles = [Patch(facecolor=c, edgecolor="none") for c in colors]
     return handles, labels
 
